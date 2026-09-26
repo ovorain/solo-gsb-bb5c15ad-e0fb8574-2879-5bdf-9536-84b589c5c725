@@ -101,6 +101,22 @@
           padding: 1px 8px; font-size: 12px; font-weight: 600; white-space: nowrap; }
   .tk-summary-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
   @media (max-width: 760px) { .tk-summary-grid { grid-template-columns: 1fr; } }
+  /* ---- 术语统一替换 ---- */
+  .tm-entry { border: 1px solid #e5e7eb; border-radius: 6px; padding: 8px 10px;
+           margin-bottom: 8px; background: #f9fafb; }
+  .tm-entry.tm-changed { background: #fffbeb; }
+  .tm-meta { color: #6b7280; font-size: 12px; margin-bottom: 4px; }
+  .tm-body { display: grid; grid-template-columns: 5em 1fr; gap: 6px; font-size: 13px; }
+  .tm-body .tm-label { color: #6b7280; }
+  .tm-text { font-family: ui-monospace, Consolas, monospace; white-space: pre-wrap; word-break: break-all; }
+  .tm-mark { background: #bbf7d0; color: #14532d; border-radius: 3px; padding: 0 2px; }
+  .tm-hits { margin-top: 6px; }
+  .tm-hit { display: inline-block; border-radius: 4px; padding: 2px 8px; margin: 2px 6px 2px 0;
+           font-size: 12px; font-family: ui-monospace, Consolas, monospace; }
+  .tm-hit.adopted { background: #dcfce7; color: #15803d; border: 1px solid #86efac; }
+  .tm-hit.discarded { background: #f3f4f6; color: #9ca3af; text-decoration: line-through;
+           border: 1px dashed #d1d5db; }
+  .tm-none { color: #9ca3af; font-size: 12px; }
 </style>
 </head>
 <body>
@@ -423,6 +439,43 @@
   </div>
   <div id="tkMessage"></div>
   <div id="tkResult"></div>
+</div>
+
+<hr class="feature-divider">
+<h1 id="term">术语统一替换</h1>
+<p class="hint">粘贴或上传 SRT，并<strong>逐行录入术语规则</strong>，格式为 <code>标准词=别名1|别名2</code>（空行跳过；
+标准词与每个别名均不能为空；同一别名（忽略 ASCII 大小写）不能对应不同标准词）。
+后端按<strong>原正文一次性查找</strong>全部别名，匹配时<strong>忽略 ASCII 大小写</strong>（非 ASCII 字符仍按原样精确匹配），
+<strong>不会边替换边继续匹配</strong>。同条字幕的重叠命中用<strong>全局规划</strong>选出互不重叠的组合，依次
+<strong>最大化被替换的原文字符数</strong>、<strong>最小化替换次数</strong>，平局取<strong>命中起点序列字典序最小</strong>；
+端点相触（前一命中尾 = 后一命中头）不算重叠。预览逐条显示原文、命中位置（行:列）、采用与舍弃的命中及舍弃原因，
+确认后下载<strong>保留原序号与时间</strong>的修订 SRT；<strong>无任何命中时也可下载原样内容</strong>。</p>
+
+<div class="card">
+  <h2>22. SRT 与逐行术语规则</h2>
+  <div class="track-grid">
+    <div class="track-box">
+      <h3>SRT 字幕
+        <input type="file" id="tmFile" accept=".srt,.txt" style="font-size:12px;font-weight:normal">
+      </h3>
+      <textarea id="tmSrt" placeholder="1&#10;00:00:01,000 --> 00:00:03,000&#10;AI 正在学习&#10;&#10;2&#10;00:00:04,000 --> 00:00:06,000&#10;机器人出门"></textarea>
+    </div>
+    <div class="track-box">
+      <h3>逐行规则（标准词=别名1|别名2）</h3>
+      <textarea id="tmRules" style="min-height:200px" placeholder="人工智能=AI|ai|人工智能&#10;机器人=Robot|机器人"></textarea>
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>23. 预览替换与下载修订 SRT</h2>
+  <div class="toolbar">
+    <button onclick="tmPreview()">预览术语替换</button>
+    <button id="tmExportBtn" onclick="tmExport()" disabled>下载修订后 SRT</button>
+    <span class="hint" id="tmExportHint">请先预览，SRT 与术语规则校验通过后才能下载（无命中也可下载原样内容）</span>
+  </div>
+  <div id="tmMessage"></div>
+  <div id="tmResult"></div>
 </div>
 
 <script>
@@ -1599,6 +1652,121 @@ async function tkExport() {
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
   a.download = "talkover.csv";
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+// ------------------------------------------------------------ 术语统一替换
+
+bindTrackFile("tmFile", "tmSrt");
+
+function tmPayload() {
+  return JSON.stringify({ srt: $("tmSrt").value, rules: $("tmRules").value });
+}
+
+function showTmError(msg) {
+  $("tmMessage").innerHTML = `<div class="error">⚠ ${escapeHtml(msg)}</div>`;
+  $("tmResult").innerHTML = "";
+  $("tmExportBtn").disabled = true;
+}
+
+function tmErrDetail(data) {
+  if (!data || data.detail == null) return "请求失败";
+  if (typeof data.detail === "string") return data.detail;
+  if (Array.isArray(data.detail)) return data.detail.map(d => d.msg || JSON.stringify(d)).join("；");
+  return data.detail.message || JSON.stringify(data.detail);
+}
+
+// 用采用命中把修订正文切片高亮：修订只改命中区间内字符，区间外偏移按
+// 「标准词长度 − 原别名长度」累计位移换算（命中按起点升序、互不重叠）。
+function renderTmRevised(e) {
+  const adopted = e.hits.filter(h => h.adopted).sort((a, b) => a.start - b.start);
+  if (!adopted.length) return escapeHtml(e.revised);
+  let out = "", cursor = 0, shift = 0;
+  for (const h of adopted) {
+    const stdLen = h.standard.length;
+    const markStart = h.start + shift;
+    const markEnd = markStart + stdLen;
+    out += escapeHtml(e.revised.slice(cursor, markStart));
+    out += `<span class="tm-mark" title="命中 #${h.id}：${escapeHtml(h.alias)} → ${escapeHtml(h.standard)}">` +
+           escapeHtml(e.revised.slice(markStart, markEnd)) + `</span>`;
+    cursor = markEnd;
+    shift += stdLen - (h.end - h.start);
+  }
+  out += escapeHtml(e.revised.slice(cursor));
+  return out;
+}
+
+function renderTmEntry(e) {
+  const hits = e.hits.length ? e.hits.map(h => {
+    const cls = h.adopted ? "adopted" : "discarded";
+    let why = "";
+    if (!h.adopted) {
+      why = h.conflicts.length
+        ? `（与采用命中 ${h.conflicts.map(i => "#" + i).join("、")} 重叠，舍弃）`
+        : "（规划未采用）";
+    }
+    const pos = `${h.line}:${h.column}`;
+    return `<span class="tm-hit ${cls}" title="规则第 ${h.rule_row} 行">` +
+      `#${h.id} [${pos}] ${h.adopted ? "✓采用" : "✗舍弃"} ` +
+      `<strong>${escapeHtml(h.matched)}</strong> → ${escapeHtml(h.standard)}` +
+      `<span class="hint"> ${escapeHtml(why)}</span></span>`;
+  }).join("") : `<span class="tm-none">无命中，正文保持不变。</span>`;
+  return `
+    <div class="tm-entry ${e.changed ? "tm-changed" : ""}">
+      <div class="tm-meta">#${e.seq}（原序号 ${escapeHtml(e.index)}） · ${escapeHtml(e.time)} ·
+        命中 ${e.hit_count}（采用 ${e.adopted_count} / 舍弃 ${e.discarded_count}）</div>
+      <div class="tm-body">
+        <div class="tm-label">原文</div>
+        <div class="tm-text">${escapeHtml(e.text)}</div>
+        <div class="tm-label">命中</div>
+        <div class="tm-hits">${hits}</div>
+        <div class="tm-label">修订正文</div>
+        <div class="tm-text">${renderTmRevised(e)}</div>
+      </div>
+    </div>`;
+}
+
+function renderTmPreview(pv) {
+  $("tmResult").innerHTML = pv.entries.map(renderTmEntry).join("");
+  const banner = pv.hit_count === 0
+    ? `<div class="bad-banner">✗ 字幕 ${pv.entry_count} 条 / 规则 ${pv.rule_count} 行（别名 ${pv.alias_count} 个），` +
+      `没有任何命中；仍可下载，文件即原样内容。</div>`
+    : `<div class="ok-banner">✓ 字幕 ${pv.entry_count} 条 / 规则 ${pv.rule_count} 行（别名 ${pv.alias_count} 个）；` +
+      `命中 ${pv.hit_count} 处，采用 ${pv.adopted_count} 处、因重叠舍弃 ${pv.discarded_count} 处，` +
+      `${pv.changed_count} 条字幕被修订，可以下载。</div>`;
+  $("tmMessage").innerHTML = banner;
+  $("tmExportBtn").disabled = false;
+}
+
+async function tmPreview() {
+  $("tmMessage").innerHTML = "";
+  let res;
+  try {
+    res = await fetch("/api/term/preview", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: tmPayload(),
+    });
+  } catch (e) { return showTmError("网络错误：" + e); }
+  const data = await res.json();
+  if (res.ok) return renderTmPreview(data);
+  return showTmError(tmErrDetail(data));
+}
+
+async function tmExport() {
+  let res;
+  try {
+    res = await fetch("/api/term/export", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: tmPayload(),
+    });
+  } catch (e) { return showTmError("网络错误：" + e); }
+  if (!res.ok) {
+    const data = await res.json();
+    return showTmError(tmErrDetail(data) || "下载被拒绝");
+  }
+  const blob = await res.blob();
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "terminology.srt";
   a.click();
   URL.revokeObjectURL(a.href);
 }

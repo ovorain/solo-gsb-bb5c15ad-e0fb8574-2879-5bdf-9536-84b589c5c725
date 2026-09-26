@@ -17,7 +17,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 
-app = FastAPI(title="SRT 字幕时间校准 / 片段剪辑 / 双语合成 / 阅读速度修复 / 修订差异对照 / 目标词时间标记 / 字幕遮挡避让 / 字幕章节索引 / 字幕空隙提示编排 / 角色抢话分析")
+app = FastAPI(title="SRT 字幕时间校准 / 片段剪辑 / 双语合成 / 阅读速度修复 / 修订差异对照 / 目标词时间标记 / 字幕遮挡避让 / 字幕章节索引 / 字幕空隙提示编排 / 角色抢话分析 / 术语统一替换")
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -2808,4 +2808,340 @@ def talkover_export(req: TalkoverRequest):
         content=b"\xef\xbb\xbf" + buf.getvalue().encode("utf-8"),
         media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": 'attachment; filename="talkover.csv"'},
+    )
+
+
+# ---------------------------------------------------------------- 术语统一替换
+
+class TermRequest(BaseModel):
+    srt: str
+    rules: str  # 逐行规则：标准词=别名1|别名2
+
+
+MAX_TERM_ALIASES = 2_000     # 全部规则行的别名总数上限
+MAX_TERM_HITS_PER_ENTRY = 20_000  # 单条字幕候选命中数上限（重叠组合规划规模）
+
+
+def _ascii_lower(s: str) -> str:
+    """仅把 ASCII 大写 A-Z 转小写，其余字符（含非 ASCII 字母）原样保留。
+
+    需求规定匹配只忽略 ASCII 大小写，故不能用 str.casefold() / lower()
+    （二者会改变非 ASCII 字母，如 'İ'、'ß'）。
+    """
+    return "".join(chr(ord(c) + 32) if 65 <= ord(c) <= 90 else c for c in s)
+
+
+def parse_term_rules(text: str) -> List[dict]:
+    """逐行解析「标准词=别名1|别名2」规则。
+
+    - 空行跳过；每行按第一个 '=' 切分，标准词、别名均去首尾空白；
+    - 标准词不能为空；至少 1 个别名，每个别名不能为空；
+    - 同一行内重复的别名（ASCII 大小写不敏感）只保留首次出现；
+    - 同一别名（ASCII 大小写不敏感）不得对应不同标准词，跨行冲突报错；
+    - 匹配只忽略 ASCII 大小写，以小写化后的别名作为命中键。
+
+    返回 [{row, standard, aliases: [(别名原形, 匹配键)...]}]（row 为输入行号）。
+    """
+    rules = []
+    alias_to_standard = {}  # 匹配键 -> 标准词（跨规则检测别名冲突）
+    for i, line in enumerate(
+        text.replace("\r\n", "\n").replace("\r", "\n").split("\n"), 1
+    ):
+        if not line.strip():
+            continue
+        if "=" not in line:
+            raise ValueError(f"术语规则第 {i} 行：须为「标准词=别名1|别名2」格式（缺少 =）")
+        std_raw, rest = line.split("=", 1)
+        standard = std_raw.strip()
+        if not standard:
+            raise ValueError(f"术语规则第 {i} 行：标准词不能为空")
+        aliases = []
+        for alias in rest.split("|"):
+            alias = alias.strip()
+            if not alias:
+                raise ValueError(
+                    f"术语规则第 {i} 行：存在空别名（标准词「{standard}」）"
+                )
+            key = _ascii_lower(alias)
+            prev = alias_to_standard.get(key)
+            if prev is not None:
+                if prev != standard:
+                    raise ValueError(
+                        f"别名「{alias}」同时对应标准词「{prev}」与「{standard}」"
+                        f"（规则第 {i} 行），同一别名不能对应不同标准词"
+                    )
+                continue  # 同一标准词下重复出现的别名（含大小写差异）只保留首次
+            alias_to_standard[key] = standard
+            aliases.append((alias, key))
+        if not aliases:
+            # 整行别名都与此前同一标准词的别名重复：纯冗余行，跳过
+            continue
+        rules.append({"row": i, "standard": standard, "aliases": aliases})
+    if not rules:
+        raise ValueError("请至少填写 1 行术语规则（每行：标准词=别名1|别名2）")
+    total = sum(len(r["aliases"]) for r in rules)
+    if total > MAX_TERM_ALIASES:
+        raise ValueError(
+            f"别名总数 {total} 超过上限 {MAX_TERM_ALIASES}，请精简术语规则后重试"
+        )
+    return rules
+
+
+def _find_alias_hits(body: str, rules: List[dict]) -> List[dict]:
+    """在一条字幕正文上一次性查找全部别名命中（不边替换边继续匹配）。
+
+    匹配忽略 ASCII 大小写（匹配键为别名的 ASCII 小写形式）；允许相互
+    重叠的命中（含同别名的重叠出现，如 aa 在 aaa 中命中两次）。
+    返回命中列表：{start, end, key, alias, standard, rule_row}，
+    按 (start, end, 别名原形, 标准词) 排序；同一 (start,end,key) 至多一条
+    （别名键全局唯一，不可能跨标准词重复）。
+    """
+    hits = []
+    lower = None  # 惰性生成：仅在有别名时才整体小写化一次
+    for r in rules:
+        for alias, key in r["aliases"]:
+            L = len(key)
+            if L == 0:
+                continue
+            if lower is None:
+                lower = _ascii_lower(body)
+            start = 0
+            while True:
+                p = lower.find(key, start)
+                if p < 0:
+                    break
+                hits.append({
+                    "start": p,
+                    "end": p + L,
+                    "key": key,
+                    "alias": alias,
+                    "standard": r["standard"],
+                    "rule_row": r["row"],
+                })
+                start = p + 1  # 允许重叠命中
+    hits.sort(key=lambda h: (h["start"], h["end"], h["alias"], h["standard"]))
+    return hits
+
+
+def plan_term_hits(hits: List[dict]) -> List[int]:
+    """在一条字幕的全部候选命中中选互不重叠组合的加权区间调度。
+
+    命中 i 占据 [start, end)（半开区间，端点相触不算重叠）。目标依次为：
+      1) 最大化被替换的原文字符数（选中区间并集长度）；
+      2) 字符数并列时，最小化替换次数（选中命中数最少）；
+      3) 仍并列时，命中起点序列（升序）字典序最小。
+
+    三级目标编码为单个整数（值越大越优，全跳过方案为 0）：
+        覆盖字符数 × cnt_unit − 替换次数 × seq_unit + 起点序列编码。
+    命中按起点升序、起点相同按终点升序排列后做后缀 DP：选中 i 后只能接
+    first[i]（首个 start >= end_i 的命中）。起点编码把越早的命中放在越
+    高位（位 H-1-i），选中置 1；等元素子集的字典序由最低差异下标决定，
+    而越低的下标对应越高的二进制位，故等字符数、等次数时编码值越大起点
+    序列字典序越小。字符数、次数都相同时选中数必相同，序列等长、比较合法。
+    返回选中命中在（已排序）hits 中的下标。
+    """
+    H = len(hits)
+    if H == 0:
+        return []
+    if H > MAX_TERM_HITS_PER_ENTRY:
+        raise ValueError(
+            f"单条字幕候选命中数 {H} 超过规划上限 {MAX_TERM_HITS_PER_ENTRY}，"
+            "请精简别名或裁短字幕后重试"
+        )
+
+    starts = [h["start"] for h in hits]
+    ends = [h["end"] for h in hits]
+    import bisect
+    # first[i]：第一个与命中 i 不重叠（start >= end_i）的命中下标
+    first = [bisect.bisect_left(starts, ends[i]) for i in range(H)]
+
+    seq_unit = 1 << H          # 起点序列编码占 H 位
+    cnt_unit = (H + 1) << H    # 次数位严格高于序列位（次数 0..H）
+    # dp[i] = 从命中 i..H-1 中选择时的最优值；dp[H] = 0（无可选命中）
+    dp = [0] * (H + 1)
+    chosen = bytearray(H)  # 回溯标记：最优后缀是否选中当前命中
+    for i in range(H - 1, -1, -1):
+        cover = ends[i] - starts[i]
+        take = cover * cnt_unit - seq_unit + dp[first[i]] + (1 << (H - 1 - i))
+        skip = dp[i + 1]
+        if take > skip:  # 值越大越优；相等时三级目标均相同，保持跳过即可
+            dp[i] = take
+            chosen[i] = 1
+        else:
+            dp[i] = skip
+
+    picked = []
+    i = 0
+    while i < H:
+        if chosen[i]:
+            picked.append(i)
+            i = first[i]
+        else:
+            i += 1
+    return picked
+
+
+def _line_starts(body: str) -> List[int]:
+    """正文各行首字符在整体中的偏移（0 起），行数 = 列表长度。"""
+    pos = [0]
+    for k, ch in enumerate(body):
+        if ch == "\n":
+            pos.append(k + 1)
+    return pos
+
+
+def revise_entry(entry: dict, rules: List[dict]) -> dict:
+    """对一条字幕做一次性命中查找、全局重叠规划与替换，返回修订结果。
+
+    {entry, body, old_lines, new_lines, changed, hits}；hits 中每个命中
+    带 adopted（是否采用）、位置信息（偏移 / 行列，1 起）与 conflicts
+    （舍弃命中与之重叠的已采用命中 id 列表）。替换只对规划选中的原文字段
+    做一次切片拼接，不在替换后的文本上继续匹配。
+    """
+    body = "\n".join(entry["lines"])
+    raw_hits = _find_alias_hits(body, rules)
+    picked = set(plan_term_hits(raw_hits))
+
+    line_starts = _line_starts(body)
+    import bisect
+    hits = []
+    for idx, h in enumerate(raw_hits):
+        adopted = idx in picked
+        li = bisect.bisect_right(line_starts, h["start"]) - 1
+        col = h["start"] - line_starts[li] + 1
+        hit = {
+            "id": idx + 1,
+            "adopted": adopted,
+            "start": h["start"],
+            "end": h["end"],
+            "line": li + 1,
+            "column": col,
+            "matched": body[h["start"]:h["end"]],
+            "alias": h["alias"],
+            "standard": h["standard"],
+            "rule_row": h["rule_row"],
+            "conflicts": [],
+        }
+        hits.append(hit)
+
+    adopted_hits = [hits[i] for i in sorted(picked)]
+    for h in hits:
+        if h["adopted"]:
+            continue
+        # 与该舍弃命中区间相交的已采用命中（半开区间：start < end 且 end > start）
+        h["conflicts"] = [
+            a["id"] for a in adopted_hits
+            if a["start"] < h["end"] and a["end"] > h["start"]
+        ]
+
+    # 仅对采用命中做一次切片替换：从后往前替换避免位移
+    chars = body
+    for h in reversed(adopted_hits):
+        chars = chars[:h["start"]] + h["standard"] + chars[h["end"]:]
+    new_lines = chars.split("\n")
+    return {
+        "entry": entry,
+        "body": body,
+        "old_lines": list(entry["lines"]),
+        "new_lines": new_lines,
+        "changed": bool(adopted_hits),
+        "hits": hits,
+    }
+
+
+def revise_entries(entries: List[dict], rules: List[dict]) -> List[dict]:
+    """逐条字幕完成术语替换规划；命中数超限时抛 ValueError。"""
+    out = []
+    for entry in entries:
+        out.append(revise_entry(entry, rules))
+    return out
+
+
+def _term_prepare(req: "TermRequest"):
+    """术语替换公共预处理：解析规则与 SRT，失败抛 400。"""
+    try:
+        rules = parse_term_rules(req.rules)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    try:
+        entries = parse_srt(req.srt)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    try:
+        results = revise_entries(entries, rules)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return entries, rules, results
+
+
+def _term_hit_payload(h: dict) -> dict:
+    return {
+        "id": h["id"],
+        "adopted": h["adopted"],
+        "start": h["start"],
+        "end": h["end"],
+        "line": h["line"],
+        "column": h["column"],
+        "matched": h["matched"],
+        "alias": h["alias"],
+        "standard": h["standard"],
+        "rule_row": h["rule_row"],
+        "conflicts": h["conflicts"],
+    }
+
+
+@app.post("/api/term/preview")
+def term_preview(req: TermRequest):
+    entries, rules, results = _term_prepare(req)
+    items = []
+    total_hits = adopted_total = discarded_total = 0
+    changed_count = 0
+    for seq, r in enumerate(results, 1):
+        e = r["entry"]
+        adopted = sum(1 for h in r["hits"] if h["adopted"])
+        discarded = len(r["hits"]) - adopted
+        total_hits += len(r["hits"])
+        adopted_total += adopted
+        discarded_total += discarded
+        if r["changed"]:
+            changed_count += 1
+        items.append({
+            "seq": seq,
+            "index": e["index"],
+            "time": f"{fmt_time(e['start'])} --> {fmt_time(e['end'])}",
+            "text": r["body"],
+            "revised": "\n".join(r["new_lines"]),
+            "changed": r["changed"],
+            "hit_count": len(r["hits"]),
+            "adopted_count": adopted,
+            "discarded_count": discarded,
+            "hits": [_term_hit_payload(h) for h in r["hits"]],
+        })
+    return {
+        "entry_count": len(entries),
+        "rule_count": len(rules),
+        "alias_count": sum(len(r["aliases"]) for r in rules),
+        "changed_count": changed_count,
+        "hit_count": total_hits,
+        "adopted_count": adopted_total,
+        "discarded_count": discarded_total,
+        "entries": items,
+    }
+
+
+@app.post("/api/term/export")
+def term_export(req: TermRequest):
+    entries, _rules, results = _term_prepare(req)
+    # 保留原序号与时间，仅替换正文；无命中时即原样内容（解析后重组）
+    blocks = [
+        f"{r['entry']['index']}\n"
+        f"{fmt_time(r['entry']['start'])} --> {fmt_time(r['entry']['end'])}\n"
+        + "\n".join(r["new_lines"] or [""])
+        for r in results
+    ]
+    content = "\n\n".join(blocks) + "\n"
+    return Response(
+        content=content.encode("utf-8"),
+        media_type="application/x-subrip",
+        headers={"Content-Disposition": 'attachment; filename="terminology.srt"'},
     )
