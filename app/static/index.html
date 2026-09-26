@@ -101,6 +101,16 @@
           padding: 1px 8px; font-size: 12px; font-weight: 600; white-space: nowrap; }
   .tk-summary-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
   @media (max-width: 760px) { .tk-summary-grid { grid-template-columns: 1fr; } }
+  /* ---- 术语统一替换 ---- */
+  .tm-hit { border: 1px solid #e5e7eb; border-radius: 6px; padding: 4px 8px;
+          margin-bottom: 4px; background: #f9fafb; font-size: 12px; }
+  .tm-hit.discarded { background: #fff; color: #9ca3af; }
+  .tm-hit.discarded .mono { text-decoration: line-through; }
+  .tm-pos { color: #6b7280; font-family: ui-monospace, Consolas, monospace; margin-right: 4px; }
+  .tm-drop-tag { display: inline-block; background: #f3f4f6; color: #6b7280; border-radius: 4px;
+          padding: 1px 6px; font-size: 12px; margin-left: 4px; }
+  tr.tm-row-changed td { background: #fffbeb; }
+  .tm-rev mark { background: #bbf7d0; color: #14532d; border-radius: 3px; padding: 0 2px; }
 </style>
 </head>
 <body>
@@ -423,6 +433,43 @@
   </div>
   <div id="tkMessage"></div>
   <div id="tkResult"></div>
+</div>
+
+<hr class="feature-divider">
+<h1 id="terms">术语统一替换</h1>
+<p class="hint">粘贴或上传 SRT，并<strong>逐行录入术语</strong>（每行 <code>标准词=别名1|别名2</code>，如 <code>人工智能=AI|ai</code>）。
+标准词与每个别名<strong>均不能为空</strong>；同一别名（忽略 ASCII 大小写）<strong>不能对应不同标准词</strong>，重复登记同一标准词会自动去重。
+对每条字幕的<strong>原正文</strong>一次性查找全部别名：匹配<strong>忽略 ASCII 大小写</strong>（非 ASCII 字符按原样比较）、允许重叠命中，
+命中全部在原文上定位，<strong>不会边替换边继续匹配</strong>。同条字幕的重叠命中用<strong>全局规划</strong>选择互不重叠的组合：
+依次使<strong>被替换的原文字符数最多</strong>、<strong>替换次数最少</strong>、<strong>采用命中起点序列字典序最小</strong>。
+预览逐条显示原文、命中位置（字符偏移）、采用与舍弃的命中及修订正文（替换处高亮）；
+下载的 SRT <strong>保留原序号与时间</strong>，没有任何命中时也可下载原样内容。</p>
+
+<div class="card">
+  <h2>22. SRT 与逐行术语</h2>
+  <div class="track-grid">
+    <div class="track-box">
+      <h3>SRT 字幕
+        <input type="file" id="tmFile" accept=".srt,.txt" style="font-size:12px;font-weight:normal">
+      </h3>
+      <textarea id="tmSrt" placeholder="1&#10;00:00:01,000 --> 00:00:03,000&#10;AI 正在改变 world&#10;&#10;2&#10;00:00:04,000 --> 00:00:06,000&#10;机器学习与 ai"></textarea>
+    </div>
+    <div class="track-box">
+      <h3>逐行术语（标准词=别名1|别名2）</h3>
+      <textarea id="tmTerms" style="min-height:200px" placeholder="人工智能=AI|ai&#10;世界=world"></textarea>
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>23. 预览替换与下载修订 SRT</h2>
+  <div class="toolbar">
+    <button onclick="tmPreview()">预览替换结果</button>
+    <button id="tmExportBtn" onclick="tmExport()" disabled>下载修订 SRT</button>
+    <span class="hint" id="tmExportHint">请先预览，校验通过后即可下载（无命中时下载原样内容）</span>
+  </div>
+  <div id="tmMessage"></div>
+  <div id="tmResult"></div>
 </div>
 
 <script>
@@ -1599,6 +1646,99 @@ async function tkExport() {
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
   a.download = "talkover.csv";
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+// ------------------------------------------------------------ 术语统一替换
+
+bindTrackFile("tmFile", "tmSrt");
+
+function tmPayload() {
+  return JSON.stringify({ srt: $("tmSrt").value, terms: $("tmTerms").value });
+}
+
+function showTmError(msg) {
+  $("tmMessage").innerHTML = `<div class="error">⚠ ${escapeHtml(msg)}</div>`;
+  $("tmResult").innerHTML = "";
+  $("tmExportBtn").disabled = true;
+}
+
+function tmErrDetail(data) {
+  if (!data || data.detail == null) return "请求失败";
+  if (typeof data.detail === "string") return data.detail;
+  if (Array.isArray(data.detail)) return data.detail.map(d => d.msg || JSON.stringify(d)).join("；");
+  return data.detail.message || JSON.stringify(data.detail);
+}
+
+function renderTmHit(h) {
+  return `
+    <div class="tm-hit ${h.adopted ? "adopted" : "discarded"}">
+      <span class="tm-pos">[${h.start}–${h.end}]</span>
+      <span class="mono">「${escapeHtml(h.surface)}」→「${escapeHtml(h.std)}」</span>
+      <span class="hint">别名 ${escapeHtml(h.alias)} · 术语行 #${h.row}</span>
+      <span class="${h.adopted ? "merged-tag" : "tm-drop-tag"}">${h.adopted ? "采用" : "舍弃"}</span>
+    </div>`;
+}
+
+function renderTmPreview(pv) {
+  const rows = pv.entries.map(e => {
+    const hits = e.hits.length
+      ? e.hits.map(renderTmHit).join("")
+      : '<div class="hint">无命中</div>';
+    const revised = e.segments.map(s =>
+      s.rep ? `<mark>${escapeHtml(s.text)}</mark>` : escapeHtml(s.text)).join("");
+    return `
+      <tr class="${e.changed ? "tm-row-changed" : ""}">
+        <td>${e.seq}</td>
+        <td>${escapeHtml(e.index)}</td>
+        <td class="mono">${escapeHtml(e.time)}</td>
+        <td class="mono">${escapeHtml(e.text)}</td>
+        <td>${hits}</td>
+        <td class="mono tm-rev">${revised}</td>
+      </tr>`;
+  }).join("");
+  $("tmResult").innerHTML = `<table>
+    <tr><th style="width:3em">#</th><th style="width:4em">原序号</th><th>时间</th>
+    <th style="width:20%">原文</th><th style="width:32%">命中（位置为字符偏移，左闭右开）</th><th>修订正文</th></tr>
+    ${rows}</table>`;
+  $("tmMessage").innerHTML = pv.hit_count
+    ? `<div class="ok-banner">✓ 字幕 ${pv.entry_count} 条 / 术语 ${pv.term_count} 行（别名 ${pv.alias_count} 个）；` +
+      `命中 ${pv.hit_count} 处：采用 <strong>${pv.adopted_count}</strong> 处、舍弃 ${pv.discarded_count} 处，` +
+      `修订 ${pv.changed_count} 条字幕，可以下载。</div>`
+    : `<div class="ok-banner">✓ 字幕 ${pv.entry_count} 条 / 术语 ${pv.term_count} 行（别名 ${pv.alias_count} 个）；` +
+      `没有任何命中，下载将得到原样内容。</div>`;
+  $("tmExportBtn").disabled = false;
+}
+
+async function tmPreview() {
+  $("tmMessage").innerHTML = "";
+  let res;
+  try {
+    res = await fetch("/api/terms/preview", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: tmPayload(),
+    });
+  } catch (e) { return showTmError("网络错误：" + e); }
+  const data = await res.json();
+  if (res.ok) return renderTmPreview(data);
+  return showTmError(tmErrDetail(data));
+}
+
+async function tmExport() {
+  let res;
+  try {
+    res = await fetch("/api/terms/export", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: tmPayload(),
+    });
+  } catch (e) { return showTmError("网络错误：" + e); }
+  if (!res.ok) {
+    const data = await res.json();
+    return showTmError(tmErrDetail(data) || "下载被拒绝");
+  }
+  const blob = await res.blob();
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "terms_replaced.srt";
   a.click();
   URL.revokeObjectURL(a.href);
 }

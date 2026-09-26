@@ -17,7 +17,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 
-app = FastAPI(title="SRT 字幕时间校准 / 片段剪辑 / 双语合成 / 阅读速度修复 / 修订差异对照 / 目标词时间标记 / 字幕遮挡避让 / 字幕章节索引 / 字幕空隙提示编排 / 角色抢话分析")
+app = FastAPI(title="SRT 字幕时间校准 / 片段剪辑 / 双语合成 / 阅读速度修复 / 修订差异对照 / 目标词时间标记 / 字幕遮挡避让 / 字幕章节索引 / 字幕空隙提示编排 / 角色抢话分析 / 术语统一替换")
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -2808,4 +2808,272 @@ def talkover_export(req: TalkoverRequest):
         content=b"\xef\xbb\xbf" + buf.getvalue().encode("utf-8"),
         media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": 'attachment; filename="talkover.csv"'},
+    )
+
+
+# ---------------------------------------------------------------- 术语统一替换
+
+class TermRequest(BaseModel):
+    srt: str
+    terms: str  # 逐行术语：标准词=别名1|别名2
+
+
+def _ascii_lower(s: str) -> str:
+    """仅把 ASCII 大写字母转为小写，其余字符（含非 ASCII）原样保留。"""
+    return "".join(chr(ord(c) + 32) if "A" <= c <= "Z" else c for c in s)
+
+
+def _parse_term_lines(text: str) -> List[dict]:
+    """逐行解析术语「标准词=别名1|别名2」。
+
+    空行跳过；标准词与每个别名去首尾空白后均不得为空；同一别名
+    （忽略 ASCII 大小写）不得对应不同标准词，同一标准词重复登记同一
+    别名时去重。返回 [{row, std, aliases:[{alias, key}]}]，key 为归一化
+    别名，aliases 按行内顺序去重。
+    """
+    out = []
+    owner = {}  # 归一化别名 -> (标准词, 首次登记行号)
+    for i, line in enumerate(
+        text.replace("\r\n", "\n").replace("\r", "\n").split("\n"), 1
+    ):
+        if not line.strip():
+            continue
+        std, sep, alias_part = line.partition("=")
+        std = std.strip()
+        if not sep or not std:
+            raise ValueError(
+                f"术语第 {i} 行：须为「标准词=别名1|别名2」格式，且标准词不能为空"
+            )
+        aliases = []
+        seen_in_line = set()
+        for piece in alias_part.split("|"):
+            alias = piece.strip()
+            if not alias:
+                raise ValueError(f"术语第 {i} 行：别名不能为空")
+            key = _ascii_lower(alias)
+            if key in seen_in_line:
+                continue
+            seen_in_line.add(key)
+            if key in owner and owner[key][0] != std:
+                raise ValueError(
+                    f"术语第 {i} 行：别名「{alias}」已对应标准词「{owner[key][0]}」"
+                    f"（第 {owner[key][1]} 行），不能同时对应「{std}」"
+                )
+            owner.setdefault(key, (std, i))
+            aliases.append({"alias": alias, "key": key})
+        out.append({"row": i, "std": std, "aliases": aliases})
+    if not out:
+        raise ValueError("请至少填写 1 行术语（每行：标准词=别名1|别名2）")
+    return out
+
+
+def _collect_term_aliases(terms: List[dict]) -> List[dict]:
+    """汇总全部别名：按归一化别名去重，保留首次登记的标准词 / 行号 / 写法。
+
+    返回 [{key, std, row, alias, order}]，order 为登记顺序，用于同一跨度
+    完全并列时的确定性兜底（先登记者优先）。
+    """
+    uniq = {}
+    for t in terms:
+        for a in t["aliases"]:
+            if a["key"] not in uniq:
+                uniq[a["key"]] = {
+                    "key": a["key"], "std": t["std"],
+                    "row": t["row"], "alias": a["alias"],
+                }
+    aliases = list(uniq.values())
+    for k, a in enumerate(aliases):
+        a["order"] = k
+    return aliases
+
+
+def find_term_hits(text: str, aliases: List[dict]) -> List[dict]:
+    """在原文 text 上一次性查找全部别名（忽略 ASCII 大小写，允许重叠命中）。
+
+    位置为 text 的字符偏移（左闭右开）；命中全部在原文上定位，后续不在
+    修订文本上继续匹配。返回按 (起点, 终点, 登记顺序) 排序的命中列表。
+    """
+    norm = _ascii_lower(text)
+    hits = []
+    for a in aliases:
+        key = a["key"]
+        size = len(key)
+        start = 0
+        while True:
+            p = norm.find(key, start)
+            if p < 0:
+                break
+            hits.append({
+                "start": p,
+                "end": p + size,
+                "surface": text[p:p + size],
+                "alias": a["alias"],
+                "std": a["std"],
+                "row": a["row"],
+                "order": a["order"],
+            })
+            start = p + 1  # 允许重叠命中（如 aa 在 aaa 中命中两次）
+    hits.sort(key=lambda h: (h["start"], h["end"], h["order"]))
+    return hits
+
+
+def plan_term_replacements(text: str, hits: List[dict]):
+    """从同条字幕的全部命中中规划互不重叠的采用组合。
+
+    目标依次：最大化被替换的原文字符数、最小化替换次数、采用命中的起点
+    序列（升序）字典序最小；完全并列（同一跨度命中不同术语）时按别名登记
+    顺序取先者。命中全部在原文上定位，规划确定后一次性改写，不能边替换
+    边继续匹配。
+
+    按字符位置自右向左 DP：dp[pos] 为后缀 text[pos:] 的最优
+    (替换字符数, 替换次数, 起点序列)，choice[pos] 记录选中的命中
+    （None 表示该字符不替换）。同一起点的命中已按 (终点, 登记顺序) 排序，
+    严格更优才替换，故完全并列时先登记者胜出。字幕正文规模下起点序列
+    元组比较开销可忽略。返回 (adopted, discarded)，均按起点升序。
+    """
+    L = len(text)
+    by_start = {}
+    for h in hits:
+        by_start.setdefault(h["start"], []).append(h)
+    dp = [None] * (L + 1)
+    dp[L] = (0, 0, ())
+    choice = [None] * (L + 1)
+    for pos in range(L - 1, -1, -1):
+        best = dp[pos + 1]  # 不替换当前字符
+        pick = None
+        for h in by_start.get(pos, ()):
+            sub = dp[h["end"]]
+            cand = (sub[0] + h["end"] - pos, sub[1] + 1, (pos,) + sub[2])
+            if (cand[0] > best[0]
+                    or (cand[0] == best[0] and cand[1] < best[1])
+                    or (cand[0] == best[0] and cand[1] == best[1]
+                        and cand[2] < best[2])):
+                best = cand
+                pick = h
+        dp[pos] = best
+        choice[pos] = pick
+    adopted = []
+    pos = 0
+    while pos < L:
+        h = choice[pos]
+        if h is None:
+            pos += 1
+        else:
+            adopted.append(h)
+            pos = h["end"]
+    chosen = {id(h) for h in adopted}
+    discarded = [h for h in hits if id(h) not in chosen]
+    return adopted, discarded
+
+
+def _apply_term_hits(text: str, adopted: List[dict]) -> str:
+    """按采用命中一次性改写原文（adopted 互不重叠且按起点升序）。"""
+    out = []
+    pos = 0
+    for h in adopted:
+        out.append(text[pos:h["start"]])
+        out.append(h["std"])
+        pos = h["end"]
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def _term_prepare(req: "TermRequest"):
+    """术语统一替换公共预处理：解析 SRT 与逐行术语并汇总别名，失败抛 400。"""
+    try:
+        entries = parse_srt(req.srt)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    try:
+        terms = _parse_term_lines(req.terms)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return entries, terms, _collect_term_aliases(terms)
+
+
+def _term_entry_result(entry: dict, aliases: List[dict]) -> dict:
+    """对单条字幕做命中查找、替换规划与一次性改写。
+
+    返回 {text, revised, changed, hits, segments}：hits 为全部命中（含采用
+    标志，按起点排序）；segments 为修订正文分段（rep=True 为替换片段），
+    供预览高亮。正文多行按换行连接后查找，命中位置为连接后文本的字符
+    偏移；别名不含换行，故命中不会跨行，改写后行结构不变。
+    """
+    text = "\n".join(entry["lines"])
+    hits = find_term_hits(text, aliases)
+    adopted, _discarded = plan_term_replacements(text, hits)
+    chosen = {id(h) for h in adopted}
+    revised = _apply_term_hits(text, adopted)
+    segments = []
+    pos = 0
+    for h in adopted:
+        if h["start"] > pos:
+            segments.append({"text": text[pos:h["start"]], "rep": False})
+        segments.append({"text": h["std"], "rep": True})
+        pos = h["end"]
+    if pos < len(text):
+        segments.append({"text": text[pos:], "rep": False})
+    return {
+        "text": text,
+        "revised": revised,
+        "changed": revised != text,
+        "hits": [
+            {
+                "start": h["start"],
+                "end": h["end"],
+                "surface": h["surface"],
+                "alias": h["alias"],
+                "std": h["std"],
+                "row": h["row"],
+                "adopted": id(h) in chosen,
+            }
+            for h in hits
+        ],
+        "segments": segments,
+    }
+
+
+@app.post("/api/terms/preview")
+def terms_preview(req: TermRequest):
+    entries, terms, aliases = _term_prepare(req)
+    items = []
+    hit_count = adopted_count = changed_count = 0
+    for i, e in enumerate(entries, 1):
+        r = _term_entry_result(e, aliases)
+        hit_count += len(r["hits"])
+        adopted_count += sum(1 for h in r["hits"] if h["adopted"])
+        changed_count += 1 if r["changed"] else 0
+        items.append({
+            "seq": i,
+            "index": e["index"],
+            "time": f"{fmt_time(e['start'])} --> {fmt_time(e['end'])}",
+            **r,
+        })
+    return {
+        "entry_count": len(entries),
+        "term_count": len(terms),
+        "alias_count": len(aliases),
+        "hit_count": hit_count,
+        "adopted_count": adopted_count,
+        "discarded_count": hit_count - adopted_count,
+        "changed_count": changed_count,
+        "entries": items,
+    }
+
+
+@app.post("/api/terms/export")
+def terms_export(req: TermRequest):
+    entries, _terms, aliases = _term_prepare(req)
+    blocks = []
+    for e in entries:
+        r = _term_entry_result(e, aliases)
+        blocks.append(
+            f"{e['index']}\n{fmt_time(e['start'])} --> {fmt_time(e['end'])}\n"
+            + (r["revised"] if r["revised"] else "")
+        )
+    content = "\n\n".join(blocks) + "\n"
+    return Response(
+        content=content.encode("utf-8"),
+        media_type="application/x-subrip",
+        headers={"Content-Disposition": 'attachment; filename="terms_replaced.srt"'},
     )
